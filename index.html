@@ -495,6 +495,75 @@ async function persist(){
   } else setSync('сохранено на телефоне','warn');
 }
 
+/* ---------- перенос записей из предыдущей версии (fc_ / facecare_v3) ---------- */
+const OLD_LKEY='facecare_v3',OLD_CPREFIX='fc_',MIG_KEY='fc4_mig',MIG_LKEY='facecare_mig4';
+const MODE_RENAME={'booster-dual':'dual'};
+
+function migDone(){try{return localStorage.getItem(MIG_LKEY)==='1';}catch(e){return false;}}
+async function migDoneCloud(){
+  if(!cloudAvail())return false;
+  try{return (await cKeys()).includes(MIG_KEY);}catch(e){return false;}
+}
+async function migMark(){
+  try{localStorage.setItem(MIG_LKEY,'1');}catch(e){}
+  if(cloudAvail()){try{await cSet(MIG_KEY,'1');}catch(e){}}
+}
+function readOldLocal(){
+  try{const r=localStorage.getItem(OLD_LKEY);if(r)return JSON.parse(r);}catch(e){}
+  return null;
+}
+async function readOldCloud(){
+  if(!cloudAvail())return null;
+  const keys=await cKeys();
+  if(!keys.includes(OLD_CPREFIX+'n'))return null;
+  const n=Number((await cGet([OLD_CPREFIX+'n']))[OLD_CPREFIX+'n']||0);
+  if(!n)return null;
+  const ids=[];for(let i=0;i<n;i++)ids.push(OLD_CPREFIX+i);
+  const v=await cGet(ids);let s='';for(const k of ids)s+=(v[k]||'');
+  try{return JSON.parse(s);}catch(e){return null;}
+}
+/* сеанс со списком режимов раскладываем на отдельные записи, по одной на режим;
+   запись без режимов — это уход без аппарата */
+function migConvert(src){
+  if(!src||!Array.isArray(src.entries))return null;
+  const out=[];
+  src.entries.forEach((e,i)=>{
+    if(!e||!e.date)return;
+    const base={date:e.date,time:e.time||'',
+                products:Array.isArray(e.products)?e.products:[],
+                note:e.note||''};
+    const ms=Array.isArray(e.modes)?e.modes.filter(Boolean):[];
+    if(!ms.length){
+      out.push(Object.assign({id:'m'+i+'c',mode:'care',pair:[],minutes:0},base));
+    }else{
+      ms.forEach((id,j)=>{
+        out.push(Object.assign({id:'m'+i+'_'+j,mode:MODE_RENAME[id]||id,pair:[],minutes:5},base));
+      });
+    }
+  });
+  if(!out.length)return null;
+  return {entries:out,products:Array.isArray(src.products)?src.products:[],theme:src.theme};
+}
+async function migrateOld(current){
+  if(migDone()||await migDoneCloud())return current;
+  let src=null;
+  try{src=await readOldCloud();}catch(e){}
+  if(!src)src=readOldLocal();
+  const conv=migConvert(src);
+  if(!conv){await migMark();return current;}
+  const have=(current&&Array.isArray(current.entries))?current.entries:[];
+  const ids=new Set(have.map(x=>x&&x.id));
+  const add=conv.entries.filter(x=>!ids.has(x.id));
+  if(!add.length){await migMark();return current;}
+  const prods=(current&&Array.isArray(current.products))?current.products.slice():[];
+  conv.products.forEach(p=>{if(p&&p.name&&!prods.some(x=>x&&x.name===p.name))prods.push(p);});
+  const merged={entries:add.concat(have),products:prods,theme:(current&&current.theme)||conv.theme};
+  saveLocal(merged);
+  if(cloudAvail()){try{await saveCloud(merged);}catch(e){}}
+  await migMark();
+  return merged;
+}
+
 /* ---------- старт ---------- */
 async function init(){
   renderThemes();
@@ -515,6 +584,11 @@ async function init(){
       else setSync('готово к записи');
     } else setSync('сохранение только на телефоне','warn');
   }
+  try{const before=data;
+      data=await migrateOld(data);
+      if(data!==before&&data&&data.entries&&data.entries.length)
+        setSync(cloudAvail()?'сохранено в телеграм':'сохранено на телефоне',cloudAvail()?'ok':'warn');
+  }catch(e){}
   entries=(data&&data.entries)?data.entries:[];
   products=(data&&data.products)?data.products:[];
 
